@@ -138,7 +138,50 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
-    // ...
+    boundingBox.keypoints.clear();
+    boundingBox.kptMatches.clear();
+    
+    vector<double> matchDistances;
+
+    for(auto it = kptMatches.begin(); it != kptMatches.end(); ++it){
+        cv::KeyPoint prevKpt = kptsPrev[it->queryIdx];
+        cv::KeyPoint currKpt = kptsCurr[it->trainIdx];
+        if(boundingBox.roi.contains(currKpt.pt)){
+            double dist = cv::norm(currKpt.pt - prevKpt.pt);
+            //cout << "distance = " << dist << endl;
+            matchDistances.push_back(dist);
+        }
+    }
+    vector<double> copy_dist = matchDistances;
+    sort(copy_dist.begin(), copy_dist.end());
+
+    vector<double> firstHalf(copy_dist.begin(), copy_dist.begin()+(copy_dist.size()/2));
+    vector<double> secondHalf(copy_dist.begin()+(copy_dist.size()/2), copy_dist.end());
+
+    double q1, q3;
+    q1 = firstHalf.size()%2 == 1 ? firstHalf.at(firstHalf.size()/2) : (firstHalf.at(firstHalf.size()/2) + firstHalf.at((firstHalf.size() - 1)/2)) / 2;
+    q3 = secondHalf.size()%2 == 1 ? secondHalf.at(secondHalf.size()/2) : (secondHalf.at(secondHalf.size()/2) + secondHalf.at((secondHalf.size() - 1)/2)) / 2;
+   
+
+    double threshold1 = q1 - 1.5*(q3-q1);
+    double threshold2 = q3 + 1.5*(q3-q1);
+    //cout << threshold1 << "  " << threshold2 << endl;
+    
+    int matchDistancesIdx = 0;
+    for(auto it = kptMatches.begin(); it != kptMatches.end(); ++it){
+        cv::KeyPoint currKpt = kptsCurr[it->trainIdx];
+
+        if(boundingBox.roi.contains(currKpt.pt)){
+            if(matchDistances[matchDistancesIdx] >= threshold1
+            && matchDistances[matchDistancesIdx] <= threshold2)
+            {
+                //cout << matchDistances[matchDistancesIdx] << endl;
+                boundingBox.keypoints.push_back(currKpt);
+                boundingBox.kptMatches.push_back(*it);
+            }
+            matchDistancesIdx++;
+        }
+    }
 }
 
 
@@ -146,18 +189,172 @@ void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
                       std::vector<cv::DMatch> kptMatches, double frameRate, double &TTC, cv::Mat *visImg)
 {
-    // ...
+    // compute distance ratios between all matched keypoints
+    vector<double> distRatios; // stores the distance ratios for all keypoints between curr. and prev. frame
+    for (auto it1 = kptMatches.begin(); it1 != kptMatches.end() - 1; ++it1)
+    { // outer kpt. loop
+
+        // get current keypoint and its matched partner in the prev. frame
+        cv::KeyPoint kpOuterCurr = kptsCurr.at(it1->trainIdx);
+        cv::KeyPoint kpOuterPrev = kptsPrev.at(it1->queryIdx);
+
+        for (auto it2 = kptMatches.begin() + 1; it2 != kptMatches.end(); ++it2)
+        { // inner kpt.-loop
+
+            double minDist = 100.0; // min. required distance
+
+            // get next keypoint and its matched partner in the prev. frame
+            cv::KeyPoint kpInnerCurr = kptsCurr.at(it2->trainIdx);
+            cv::KeyPoint kpInnerPrev = kptsPrev.at(it2->queryIdx);
+
+            // compute distances and distance ratios
+            double distCurr = cv::norm(kpOuterCurr.pt - kpInnerCurr.pt);
+            double distPrev = cv::norm(kpOuterPrev.pt - kpInnerPrev.pt);
+
+            if (distPrev > std::numeric_limits<double>::epsilon() && distCurr >= minDist)
+            { // avoid division by zero
+
+                double distRatio = distCurr / distPrev;
+                //cout << "calculatinnnnnnnnnnng = " << distRatio << endl;
+                distRatios.push_back(distRatio);
+            }
+        } // eof inner loop over all matched kpts
+    }     // eof outer loop over all matched kpts
+
+    // iQR part
+    sort(distRatios.begin(), distRatios.end());
+
+    vector<double> firstHalf(distRatios.begin(), distRatios.begin()+(distRatios.size()/2));
+    vector<double> secondHalf(distRatios.begin()+(distRatios.size()/2), distRatios.end());
+
+    double q1, q3;
+    q1 = firstHalf.size()%2 == 1 ? firstHalf.at(firstHalf.size()/2) : (firstHalf.at(firstHalf.size()/2) + firstHalf.at((firstHalf.size() - 1)/2)) / 2;
+    q3 = secondHalf.size()%2 == 1 ? secondHalf.at(secondHalf.size()/2) : (secondHalf.at(secondHalf.size()/2) + secondHalf.at((secondHalf.size() - 1)/2)) / 2;
+   
+
+    double threshold1 = q1 - 1.5*(q3-q1);
+    double threshold2 = q3 + 1.5*(q3-q1);
+    vector<double> filteredRatios;
+    for(double dr : distRatios ){
+        if(dr >= threshold1 && dr <=threshold2){
+            filteredRatios.push_back(dr);
+            //cout << "drrrrrrrrrrrrrrr = " << dr << endl;
+        }
+    }
+
+    // only continue if list of distance ratios is not empty
+    if (filteredRatios.size() == 0)
+    {
+        
+        TTC = NAN;
+        return;
+    }
+
+    long medIndex = floor(filteredRatios.size() / 2.0);
+    double medDistRatio = filteredRatios.size() % 2 == 0 ? (filteredRatios[medIndex - 1] + filteredRatios[medIndex]) / 2.0 : filteredRatios[medIndex];
+    //cout << "ratioooooooooooooooooooooo = " << medDistRatio << endl;
+    double dT = 1 / frameRate;
+    TTC = -dT / (1 - medDistRatio);
 }
 
+
+bool comparePC(LidarPoint p1, LidarPoint p2)
+{
+    return (p1.x< p2.x);
+}
 
 void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
                      std::vector<LidarPoint> &lidarPointsCurr, double frameRate, double &TTC)
 {
-    // ...
+    // auxiliary variables
+    double dT = 1/frameRate;        // time between two measurements in seconds
+    double laneWidth = 4.0; // assumed width of the ego lane
+
+    // calculate the average of the distances of not only the closest point but a percentage of the points
+    
+    float percentage = 0.3;
+    int numPrevPoints = (int)lidarPointsPrev.size() * percentage;
+    int numCurrPoints = (int)lidarPointsCurr.size() * percentage;
+    // find closest distance to Lidar points within ego lane
+    //double minXPrev = 1e9, minXCurr = 1e9;
+    vector<double> minXPrev, minXCurr; 
+    //sort lidar points based on x
+    auto copyPrev = lidarPointsPrev;
+    auto copyCurr = lidarPointsCurr;
+    sort(copyPrev.begin(), copyPrev.end(), comparePC);
+    sort(copyCurr.begin(), copyCurr.end(), comparePC);
+    
+    for (auto it = copyPrev.begin(); it != copyPrev.end(); ++it)
+    {
+        
+        if (abs(it->y) <= laneWidth / 2.0)
+        { // 3D point within ego lane?
+            if(minXPrev.size() < numPrevPoints){
+                minXPrev.push_back(it->x);
+            }
+        }
+    }
+    
+    for (auto it = copyCurr.begin(); it != copyCurr.end(); ++it)
+    {
+        
+        if (abs(it->y) <= laneWidth / 2.0)
+        { // 3D point within ego lane?
+            if(minXCurr.size() < numCurrPoints){
+                minXCurr.push_back(it->x);
+            }
+        }
+    }
+    double avgXPrev = std::accumulate(minXPrev.begin(), minXPrev.end(), 0.0)/numPrevPoints;
+    double avgXCurr = std::accumulate(minXCurr.begin(), minXCurr.end(), 0.0)/numCurrPoints;
+
+    // compute TTC from both measurements
+    TTC = avgXCurr * dT / (avgXPrev - avgXCurr);
 }
 
 
 void matchBoundingBoxes(std::vector<cv::DMatch> &matches, std::map<int, int> &bbBestMatches, DataFrame &prevFrame, DataFrame &currFrame)
 {
-    // ...
+    int votes[prevFrame.boundingBoxes.size()][currFrame.boundingBoxes.size()] = {0};
+
+    for(auto mit = matches.begin(); mit != matches.end(); ++mit)
+    {
+        int previdx = mit->queryIdx;
+        int curridx = mit->trainIdx;
+
+        cv::KeyPoint prevPt = prevFrame.keypoints[previdx];
+        cv::KeyPoint currPt = currFrame.keypoints[curridx];
+
+        vector<int> prevBboxes, currBboxes;
+        for(auto prevbit = prevFrame.boundingBoxes.begin(); prevbit != prevFrame.boundingBoxes.end(); ++prevbit )
+        {
+            if(prevbit->roi.contains(prevPt.pt)){
+                prevBboxes.push_back(prevbit->boxID);
+            }
+        }
+        for(auto currbit = currFrame.boundingBoxes.begin(); currbit != currFrame.boundingBoxes.end(); ++currbit )
+        {
+            if(currbit->roi.contains(currPt.pt)){
+                currBboxes.push_back(currbit->boxID);
+            }
+        }
+        for(auto p : prevBboxes){
+            for(auto c : currBboxes){
+                votes[p][c]++;
+            }
+        }
+    }
+    for(auto prevBbox : prevFrame.boundingBoxes){
+        int id1 = prevBbox.boxID;
+        int maxVotes = 0;
+        int bestMatchID = 0;
+        for(auto currBbox : currFrame.boundingBoxes){
+            int id2 = currBbox.boxID;
+            if(votes[id1][id2] > maxVotes){
+                maxVotes = votes[id1][id2];
+                bestMatchID = id2;
+            }
+        }
+        bbBestMatches.insert({id1, bestMatchID});
+    }
 }
